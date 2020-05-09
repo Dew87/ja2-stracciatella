@@ -26,15 +26,15 @@
 
 use std::cmp;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::io::{Seek, SeekFrom};
-use std::ops;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::file_formats::slf::{SlfEntryState, SlfHeader};
+use crate::fs::File;
 use crate::unicode::Nfc;
 
 /// Thread safe library database.
@@ -58,7 +58,7 @@ pub struct Library {
     /// Real path of the library file for display purposes.
     library_path: PathBuf,
     /// Library file open for reading.
-    library_file: File,
+    library_file: Arc<Mutex<File>>,
     /// Caseless base path of the entries in the library.
     base_path: Nfc,
     /// List of ok entries in the library.
@@ -81,10 +81,14 @@ pub struct LibraryEntry {
 /// Provides access to the data of a library entry through Read and Seek.
 #[derive(Debug)]
 pub struct LibraryFile {
-    /// The index of the entry of this file.
-    index: usize,
-    /// The thread safe library of this file.
-    arc_library: Arc<RwLock<Library>>,
+    /// Debug text.
+    debug: String,
+    /// Library file open for reading.
+    library_file: Arc<Mutex<File>>,
+    /// Start of the file data in the library file.
+    start: u64,
+    /// End of the file data in the library file.
+    end: u64,
     /// Current position in the library file.
     position: u64,
 }
@@ -137,10 +141,17 @@ impl LibraryDBInner {
         for arc_library in &self.arc_libraries {
             let library = arc_library.read().unwrap();
             if let Some(index) = library.find(&path) {
+                let debug = format!("{:?} + {:?}", &library.library_path, &path);
+                let library_file = library.library_file.clone();
+                let start = library.entries[index].data_start;
+                let end = library.entries[index].data_end;
+                let position = start;
                 return Ok(LibraryFile {
-                    index,
-                    arc_library: arc_library.to_owned(),
-                    position: library.entries[index].data_start,
+                    debug,
+                    library_file,
+                    start,
+                    end,
+                    position,
                 });
             }
         }
@@ -181,6 +192,7 @@ impl Library {
                 ));
             }
         }
+        let library_file = Arc::new(Mutex::new(library_file));
         Ok(Library {
             library_path,
             library_file,
@@ -208,33 +220,20 @@ impl Library {
 impl LibraryFile {
     /// Returns the current seek position.
     pub fn current_position(&self) -> u64 {
-        let library = self.arc_library.read().unwrap();
-        let entry = &library.entries[self.index];
-        self.position - entry.data_start
+        assert!(self.position >= self.start);
+        self.position - self.start
     }
 
     /// Returns the file size.
     pub fn file_size(&self) -> u64 {
-        let library = self.arc_library.read().unwrap();
-        let entry = &library.entries[self.index];
-        entry.data_end - entry.data_start
+        assert!(self.end >= self.start);
+        self.end - self.start
     }
 }
 
 impl Default for LibraryDB {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Panics if a library file is still open during the destruction of LibraryDBInner.
-impl ops::Drop for LibraryDBInner {
-    fn drop(&mut self) {
-        for arc_library in &self.arc_libraries {
-            let library = arc_library.read().unwrap();
-            let n = Arc::strong_count(&arc_library) + Arc::weak_count(&arc_library);
-            assert!(n == 1, "{} is being shared ({} != 1)", &library, n);
-        }
     }
 }
 
@@ -271,26 +270,22 @@ impl cmp::Eq for LibraryEntry {}
 /// LibraryFile displays the library and the file path by default.
 impl fmt::Display for LibraryFile {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let library = self.arc_library.read().unwrap();
-        let entry = &library.entries[self.index];
-        write!(f, "LibraryFile {{ {}, {:?} }}", &library, &entry.file_path)
+        write!(f, "LibraryFile {{ {} }}", &self.debug)
     }
 }
 
 /// LibraryFile seeks the data of a library entry.
 impl io::Seek for LibraryFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let library = self.arc_library.write().unwrap();
-        let entry = &library.entries[self.index];
         let checked_position = match pos {
-            SeekFrom::Start(n) => entry.data_start.checked_add(n),
+            SeekFrom::Start(n) => self.start.checked_add(n),
             SeekFrom::Current(n) => checked_add_u64_i64(self.position, n),
-            SeekFrom::End(n) => checked_add_u64_i64(entry.data_end, n),
+            SeekFrom::End(n) => checked_add_u64_i64(self.end, n),
         };
         if let Some(position) = checked_position {
-            if position >= entry.data_start {
+            if position >= self.start {
                 self.position = position;
-                return Ok(position - entry.data_start);
+                return Ok(position - self.start);
             }
         }
         // must never become negative or overflow
@@ -300,21 +295,18 @@ impl io::Seek for LibraryFile {
 
 /// LibraryFile reads the data of a library entry.
 impl io::Read for LibraryFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut library = self.arc_library.write().unwrap();
-        let end = library.entries[self.index].data_end;
-        if self.position >= end {
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.end {
             return Ok(0);
         }
-        let available = end - self.position;
-        library.library_file.seek(SeekFrom::Start(self.position))?;
-        let read_result = if available < buf.len() as u64 {
-            library
-                .library_file
-                .read(buf.split_at_mut(available as usize).0)
-        } else {
-            library.library_file.read(buf)
-        };
+        if let Ok(available) = usize::try_from(self.end - self.position) {
+            if available < buf.len() {
+                buf = &mut buf[..available];
+            }
+        }
+        let mut file = self.library_file.lock().unwrap();
+        file.seek(SeekFrom::Start(self.position))?;
+        let read_result = file.read(buf);
         if let Ok(bytes) = read_result {
             self.position += bytes as u64;
         }
