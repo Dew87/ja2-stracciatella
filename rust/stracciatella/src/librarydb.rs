@@ -31,23 +31,16 @@ use std::fmt;
 use std::io;
 use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::file_formats::slf::{SlfEntryState, SlfHeader};
 use crate::fs::File;
 use crate::unicode::Nfc;
 
-/// Thread safe library database.
-#[derive(Debug)]
-pub struct LibraryDB {
-    inner: Mutex<LibraryDBInner>,
-}
-
 /// Library database.
-#[derive(Debug)]
-pub struct LibraryDBInner {
-    /// Thread safe libraries.
-    arc_libraries: Vec<Arc<RwLock<Library>>>,
+#[derive(Debug, Default)]
+pub struct LibraryDB {
+    libraries: Vec<Library>,
 }
 
 /// Library.
@@ -96,50 +89,20 @@ pub struct LibraryFile {
 impl LibraryDB {
     /// Constructor.
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(LibraryDBInner::new()),
-        }
-    }
-
-    /// Returns thread safe guard that grants direct access.
-    /// While the guard lives, no one else has access to the inner library database.
-    pub fn locked(&self) -> MutexGuard<LibraryDBInner> {
-        self.inner.lock().unwrap()
-    }
-
-    /// Opens and adds a library at the end of library database.
-    pub fn add_library(&mut self, data_dir: &Path, library: &Path) -> io::Result<()> {
-        self.locked().add_library(data_dir, library)
-    }
-
-    /// Opens a library file for reading.
-    /// The file must be dropped before the library database is dropped.
-    pub fn open_file(&self, path: &str) -> io::Result<LibraryFile> {
-        self.locked().open_file(path)
-    }
-}
-
-impl LibraryDBInner {
-    /// Constructor.
-    fn new() -> Self {
-        Self {
-            arc_libraries: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Opens and adds a library at the end of library database.
     pub fn add_library(&mut self, data_dir: &Path, library: &Path) -> io::Result<()> {
         let library = Library::open(&data_dir, &library)?;
-        self.arc_libraries.push(Arc::new(RwLock::new(library)));
+        self.libraries.push(library);
         Ok(())
     }
 
     /// Opens a library file for reading.
-    /// The file must be dropped before the library database is dropped.
     pub fn open_file(&self, path: &str) -> io::Result<LibraryFile> {
         let path = Nfc::caseless_path(&path);
-        for arc_library in &self.arc_libraries {
-            let library = arc_library.read().unwrap();
+        for library in self.libraries.iter() {
             if let Some(index) = library.find(&path) {
                 let debug = format!("{:?} + {:?}", &library.library_path, &path);
                 let library_file = library.library_file.clone();
@@ -228,12 +191,6 @@ impl LibraryFile {
     pub fn file_size(&self) -> u64 {
         assert!(self.end >= self.start);
         self.end - self.start
-    }
-}
-
-impl Default for LibraryDB {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

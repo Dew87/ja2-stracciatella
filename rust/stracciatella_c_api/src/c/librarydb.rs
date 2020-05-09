@@ -4,16 +4,24 @@
 
 use std::io;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
 
-use stracciatella::librarydb::{LibraryDB, LibraryFile};
+use stracciatella::librarydb;
+use stracciatella::librarydb::LibraryFile;
 
 use crate::c::common::*;
+
+/// Thread safe wrapper of LibraryDB.
+#[derive(Debug, Default)]
+pub struct LibraryDB {
+    inner: Arc<Mutex<librarydb::LibraryDB>>,
+}
 
 /// Constructor.
 /// The caller is responsible for the memory of the library database.
 #[no_mangle]
 pub extern "C" fn LibraryDB_create() -> *mut LibraryDB {
-    into_ptr(LibraryDB::new())
+    into_ptr(LibraryDB::default())
 }
 
 /// Destructor.
@@ -36,6 +44,7 @@ pub extern "C" fn LibraryDB_push(
     let ldb = unsafe_mut(ldb);
     let data_dir = path_buf_from_c_str_or_panic(unsafe_c_str(data_dir));
     let library = path_buf_from_c_str_or_panic(unsafe_c_str(library));
+    let mut ldb = ldb.inner.lock().unwrap();
     if let Err(err) = ldb.add_library(&data_dir, &library) {
         remember_rust_error(format!(
             "LibraryDB_push {:?} {:?}: {}",
@@ -54,6 +63,7 @@ pub extern "C" fn LibraryFile_open(ldb: *mut LibraryDB, path: *const c_char) -> 
     forget_rust_error();
     let ldb = unsafe_mut(ldb);
     let path = str_from_c_str_or_panic(unsafe_c_str(path));
+    let ldb = ldb.inner.lock().unwrap();
     match ldb.open_file(&path) {
         Err(err) => {
             remember_rust_error(format!("LibraryFile_open {:?}: {}", path, err));
